@@ -11,14 +11,16 @@ fn handle_input(input: &str) {
 }
 
 fn main() {
-    // Uncomment this block to pass the first stage
-    print!("$ ");
-    io::stdout().flush().unwrap();
+    loop {
+        // Uncomment this block to pass the first stage
+        print!("$ ");
+        io::stdout().flush().unwrap();
 
-    // Wait for user input
-    let stdin = io::stdin();
-    let mut input = String::new();
-    stdin.read_line(&mut input).unwrap();
+        // Wait for user input
+        let stdin = io::stdin();
+        let mut input = String::new();
+        stdin.read_line(&mut input).unwrap();
 
-    handle_input(input.as_str());
+        handle_input(input.as_str());
+    }
 }
