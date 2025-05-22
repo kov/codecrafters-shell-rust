@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     env::{current_dir, set_current_dir},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -11,55 +12,104 @@ struct ReplIter<'r> {
 }
 
 impl<'r> Iterator for ReplIter<'r> {
-    type Item = Result<&'r str, String>;
+    type Item = Result<Cow<'r, str>, String>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut start = None;
-        let mut in_quotes = false;
+        let mut treat_next_char_as_regular = false;
+        let mut in_single_quotes = false;
+        let mut in_double_quotes = false;
+        let mut edited: Option<String> = None;
 
         while let Some((i, c)) = self.chars.next() {
-            if c.is_ascii_whitespace() && !in_quotes {
+            if treat_next_char_as_regular {
+                treat_next_char_as_regular = false;
+                edited.as_mut().map(|s| s.push(c));
+                continue;
+            }
+
+            if c.is_ascii_whitespace() && !in_single_quotes && !in_double_quotes {
                 if let Some(start) = start {
-                    return Some(Ok(&self.command[start..i]));
+                    if let Some(edited) = edited {
+                        return Some(Ok(Cow::Owned(edited)));
+                    } else {
+                        return Some(Ok(Cow::Borrowed(&self.command[start..i])));
+                    }
                 }
                 continue;
             }
 
             match c {
-                '\'' => {
-                    in_quotes = !in_quotes;
+                '\\' => {
+                    treat_next_char_as_regular = true;
 
-                    match start {
-                        Some(start) => {
-                            // FIXME: this is not really correct, but should make tests pass..
-                            // we should parse more properly xD
-                            return Some(Ok(&self.command[start..i]));
+                    if edited.is_none() {
+                        if let Some(start) = start {
+                            edited = Some(String::from(&self.command[start..i]));
+                        } else {
+                            edited = Some(String::new())
                         }
-                        None => start = Some(i + 1),
+                    }
+
+                    if start.is_none() {
+                        start = Some(i + 1);
+                    }
+                }
+                '\'' | '"' => {
+                    if c == '\'' {
+                        if !in_double_quotes {
+                            in_single_quotes = !in_single_quotes;
+                        } else {
+                            edited.as_mut().map(|s| s.push(c));
+                        }
+                    } else if c == '"' {
+                        if !in_single_quotes {
+                            in_double_quotes = !in_double_quotes;
+                        } else {
+                            edited.as_mut().map(|s| s.push(c));
+                        }
+                    }
+
+                    if edited.is_none() {
+                        if let Some(start) = start {
+                            edited = Some(String::from(&self.command[start..i]));
+                        } else {
+                            edited = Some(String::new())
+                        }
+                    }
+
+                    if start.is_none() {
+                        start = Some(i + 1);
                     }
                 }
                 _ => {
                     if start.is_none() {
                         start = Some(i);
                     }
+
+                    edited.as_mut().map(|s| s.push(c));
                 }
             }
         }
 
         // Open quotes with no closing, error...
-        if in_quotes {
+        if in_single_quotes || in_double_quotes {
             return Some(Err(format!("Mismatched quotes in {}", self.command)));
         }
 
         if let Some(start) = start {
-            Some(Ok(&self.command[start..]))
+            if let Some(edited) = edited {
+                return Some(Ok(Cow::Owned(edited)));
+            } else {
+                return Some(Ok(Cow::Borrowed(&self.command[start..])));
+            }
         } else {
             None
         }
     }
 }
 
-fn parse_command(command: &str) -> Result<(&str, Vec<&str>), String> {
+fn parse_command(command: &str) -> Result<(Cow<'_, str>, Vec<Cow<'_, str>>), String> {
     let mut parts = ReplIter {
         command,
         chars: command.char_indices(),
@@ -68,7 +118,7 @@ fn parse_command(command: &str) -> Result<(&str, Vec<&str>), String> {
         return Err(format!("Bad input: {}", command));
     };
     let command = command?;
-    let args: Vec<&str> = parts.collect::<Result<_, _>>()?;
+    let args: Vec<Cow<'_, str>> = parts.collect::<Result<_, _>>()?;
     Ok((command, args))
 }
 
@@ -88,11 +138,11 @@ fn search_path(executable: &str) -> Option<PathBuf> {
     None
 }
 
-fn handle_cmd_type(args: Vec<&str>) {
+fn handle_cmd_type(args: Vec<Cow<'_, str>>) {
     for arg in args {
-        match arg {
+        match arg.as_ref() {
             "echo" | "exit" | "type" | "pwd" | "cd" => println!("{arg} is a shell builtin"),
-            _ => match search_path(arg) {
+            _ => match search_path(arg.as_ref()) {
                 Some(path) => println!("{arg} is {}", path.to_string_lossy()),
                 None => println!("{arg}: not found"),
             },
@@ -106,14 +156,14 @@ fn change_directory(to: &Path) {
     }
 }
 
-fn handle_cmd_cd(args: Vec<&str>) {
+fn handle_cmd_cd(args: Vec<Cow<'_, str>>) {
     if args.len() > 1 {
         println!("cd: too many arguments...");
         return;
     }
 
     let current_dir = current_dir().expect("Unable to get current working directory");
-    match args.first().map(|s| *s) {
+    match args.first().map(|s| s.as_ref()) {
         Some(".") => (),
         Some("..") => {
             if let Some(parent) = current_dir.parent() {
@@ -140,7 +190,7 @@ fn handle_input(input: &str) {
     let Ok((command, args)) = parse_command(input.trim()) else {
         return;
     };
-    match command {
+    match command.as_ref() {
         "echo" => println!("{}", args.join(" ")),
         "type" => handle_cmd_type(args),
         "cd" => handle_cmd_cd(args),
@@ -163,8 +213,11 @@ fn handle_input(input: &str) {
             }
         }
         _ => {
-            if let Some(_executable) = search_path(command) {
-                match std::process::Command::new(command).args(args).spawn() {
+            if let Some(_executable) = search_path(command.as_ref()) {
+                match std::process::Command::new(command.as_ref())
+                    .args(args.iter().map(|arg| arg.as_ref()))
+                    .spawn()
+                {
                     Ok(mut child) => {
                         let _ = child.wait();
                     }
