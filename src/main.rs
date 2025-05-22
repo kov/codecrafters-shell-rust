@@ -1,7 +1,10 @@
+use os_pipe::PipeWriter;
 use std::{
     borrow::Cow,
     env::{current_dir, set_current_dir},
-    io::{self, Write},
+    fs::File,
+    io::{self, Write as _},
+    os::fd::OwnedFd,
     path::{Path, PathBuf},
     str::CharIndices,
 };
@@ -129,17 +132,99 @@ impl<'r> Iterator for ReplIter<'r> {
     }
 }
 
-fn parse_command(command: &str) -> Result<(Cow<'_, str>, Vec<Cow<'_, str>>), String> {
-    let mut parts = ReplIter {
+#[derive(Debug)]
+struct Command<'r> {
+    command: Cow<'r, str>,
+    args: Vec<Cow<'r, str>>,
+}
+
+#[derive(Debug)]
+enum PipeTarget<'r> {
+    Redirect {
+        stdout: bool,
+        stderr: bool,
+        path: PathBuf,
+    },
+    CommandLine(Box<CommandLine<'r>>),
+}
+
+#[derive(Debug)]
+enum CommandLine<'r> {
+    Empty,
+    Command(Command<'r>),
+    Pipe {
+        source: Command<'r>,
+        target: PipeTarget<'r>,
+    },
+}
+
+fn parse_parts<'r>(mut parts: ReplIter<'r>) -> Result<CommandLine<'r>, String> {
+    let mut command = None;
+    let mut args = vec![];
+    while let Some(part) = parts.next() {
+        let part = part?;
+
+        match part.as_ref() {
+            "1>" | ">" => {
+                let Some(command) = command else {
+                    return Err(format!("Tried to redirect empty command"));
+                };
+                let args = args.drain(..).collect();
+                let target = match parts.next() {
+                    Some(target) => PathBuf::from(target?.as_ref()),
+                    None => return Err(format!("Missing redirect target")),
+                };
+                if let Some(token) = parts.next() {
+                    let token = token?;
+                    return Err(format!("Unexpected token after redirect target: {token}"));
+                }
+                return Ok(CommandLine::Pipe {
+                    source: Command { command, args },
+                    target: PipeTarget::Redirect {
+                        stdout: true,
+                        stderr: false,
+                        path: target,
+                    },
+                });
+            }
+            "|" => {
+                let Some(command) = command else {
+                    return Err(format!("Tried to redirect empty command"));
+                };
+                let args = args.drain(..).collect();
+                let target = PipeTarget::CommandLine(Box::new(parse_parts(parts)?));
+                return Ok(CommandLine::Pipe {
+                    source: Command { command, args },
+                    target,
+                });
+            }
+            _ => {
+                if command.is_none() {
+                    command = Some(part);
+                } else {
+                    args.push(part);
+                }
+            }
+        }
+    }
+
+    let Some(command) = command else {
+        return Ok(CommandLine::Empty);
+    };
+
+    Ok(CommandLine::Command(Command { command, args }))
+}
+
+fn parse_command<'r>(command: &'r str) -> Result<CommandLine<'r>, String> {
+    let parts = ReplIter {
         command,
         chars: command.char_indices(),
     };
-    let Some(command) = parts.next() else {
-        return Err(format!("Bad input: {}", command));
-    };
-    let command = command?;
-    let args: Vec<Cow<'_, str>> = parts.collect::<Result<_, _>>()?;
-    Ok((command, args))
+
+    //let res = parse_parts(parts);
+    //dbg!(&res);
+    //res
+    parse_parts(parts)
 }
 
 fn search_path(executable: &str) -> Option<PathBuf> {
@@ -158,7 +243,7 @@ fn search_path(executable: &str) -> Option<PathBuf> {
     None
 }
 
-fn handle_cmd_type(args: Vec<Cow<'_, str>>) {
+fn handle_cmd_type(args: &[Cow<'_, str>]) {
     for arg in args {
         match arg.as_ref() {
             "echo" | "exit" | "type" | "pwd" | "cd" => println!("{arg} is a shell builtin"),
@@ -176,7 +261,7 @@ fn change_directory(to: &Path) {
     }
 }
 
-fn handle_cmd_cd(args: Vec<Cow<'_, str>>) {
+fn handle_cmd_cd(args: &[Cow<'_, str>]) {
     if args.len() > 1 {
         println!("cd: too many arguments...");
         return;
@@ -206,12 +291,20 @@ fn handle_cmd_cd(args: Vec<Cow<'_, str>>) {
     }
 }
 
-fn handle_input(input: &str) {
-    let Ok((command, args)) = parse_command(input.trim()) else {
-        return;
-    };
-    match command.as_ref() {
-        "echo" => println!("{}", args.join(" ")),
+fn handle_command(
+    command: &Command,
+    stdout: Option<PipeWriter>,
+    stderr: Option<PipeWriter>,
+) -> Result<(), String> {
+    let (command, args) = (command.command.as_ref(), &command.args);
+    match command {
+        "echo" => {
+            if let Some(mut stdout) = stdout {
+                writeln!(stdout, "{}", args.join(" ")).expect("Broken pipe!")
+            } else {
+                println!("{}", args.join(" "));
+            }
+        }
         "type" => handle_cmd_type(args),
         "cd" => handle_cmd_cd(args),
         "pwd" => {
@@ -233,11 +326,16 @@ fn handle_input(input: &str) {
             }
         }
         _ => {
-            if let Some(_executable) = search_path(command.as_ref()) {
-                match std::process::Command::new(command.as_ref())
-                    .args(args.iter().map(|arg| arg.as_ref()))
-                    .spawn()
-                {
+            if let Some(_executable) = search_path(command) {
+                let mut process = std::process::Command::new(command);
+                let mut process = process.args(args.iter().map(|arg| arg.as_ref()));
+                if let Some(stdout) = stdout {
+                    process = process.stdout(stdout);
+                }
+                if let Some(stderr) = stderr {
+                    process = process.stderr(stderr);
+                }
+                match process.spawn() {
                     Ok(mut child) => {
                         let _ = child.wait();
                     }
@@ -248,6 +346,59 @@ fn handle_input(input: &str) {
             }
         }
     }
+    Ok(())
+}
+
+fn handle_command_line(command_line: CommandLine<'_>) -> Result<(), String> {
+    match command_line {
+        CommandLine::Empty => Ok(()),
+        CommandLine::Command(command) => handle_command(&command, None, None),
+        CommandLine::Pipe { source, target } => {
+            let (stdout, stderr) = match target {
+                PipeTarget::Redirect {
+                    stdout,
+                    stderr,
+                    path,
+                } => {
+                    let fd: OwnedFd = File::options()
+                        .create(true)
+                        .write(true)
+                        .open(path)
+                        .map_err(|err| err.to_string())?
+                        .into();
+                    let stdout = if stdout {
+                        Some(PipeWriter::from(fd.try_clone().unwrap()))
+                    } else {
+                        None
+                    };
+                    let stderr = if stderr {
+                        Some(PipeWriter::from(fd))
+                    } else {
+                        None
+                    };
+                    (stdout, stderr)
+                }
+                PipeTarget::CommandLine(command_line) => {
+                    unimplemented!();
+                    (None, None)
+                }
+            };
+            handle_command(&source, stdout, stderr)
+        }
+    }
+}
+
+fn handle_input(input: &str) {
+    match parse_command(input.trim()) {
+        Ok(command_line) => {
+            if let Err(msg) = handle_command_line(command_line) {
+                eprintln!("{}", msg)
+            }
+        }
+        Err(msg) => {
+            eprintln!("{}", msg);
+        }
+    };
 }
 
 fn main() {
