@@ -139,11 +139,16 @@ struct Command<'r> {
 }
 
 #[derive(Debug)]
+struct RedirectOptions {
+    append: bool,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
 enum PipeTarget<'r> {
     Redirect {
-        stdout: bool,
-        stderr: bool,
-        path: PathBuf,
+        stdout: Option<RedirectOptions>,
+        stderr: Option<RedirectOptions>,
     },
     CommandLine(Box<CommandLine<'r>>),
 }
@@ -181,9 +186,83 @@ fn parse_parts<'r>(mut parts: ReplIter<'r>) -> Result<CommandLine<'r>, String> {
                 return Ok(CommandLine::Pipe {
                     source: Command { command, args },
                     target: PipeTarget::Redirect {
-                        stdout: true,
-                        stderr: false,
-                        path: target,
+                        stdout: Some(RedirectOptions {
+                            append: false,
+                            path: target,
+                        }),
+                        stderr: None,
+                    },
+                });
+            }
+            "2>" => {
+                let Some(command) = command else {
+                    return Err(format!("Tried to redirect empty command"));
+                };
+                let args = args.drain(..).collect();
+                let target = match parts.next() {
+                    Some(target) => PathBuf::from(target?.as_ref()),
+                    None => return Err(format!("Missing redirect target")),
+                };
+                if let Some(token) = parts.next() {
+                    let token = token?;
+                    return Err(format!("Unexpected token after redirect target: {token}"));
+                }
+                return Ok(CommandLine::Pipe {
+                    source: Command { command, args },
+                    target: PipeTarget::Redirect {
+                        stdout: None,
+                        stderr: Some(RedirectOptions {
+                            append: false,
+                            path: target,
+                        }),
+                    },
+                });
+            }
+            "1>>" | ">>" => {
+                let Some(command) = command else {
+                    return Err(format!("Tried to redirect empty command"));
+                };
+                let args = args.drain(..).collect();
+                let target = match parts.next() {
+                    Some(target) => PathBuf::from(target?.as_ref()),
+                    None => return Err(format!("Missing redirect target")),
+                };
+                if let Some(token) = parts.next() {
+                    let token = token?;
+                    return Err(format!("Unexpected token after redirect target: {token}"));
+                }
+                return Ok(CommandLine::Pipe {
+                    source: Command { command, args },
+                    target: PipeTarget::Redirect {
+                        stdout: Some(RedirectOptions {
+                            append: true,
+                            path: target,
+                        }),
+                        stderr: None,
+                    },
+                });
+            }
+            "2>>" => {
+                let Some(command) = command else {
+                    return Err(format!("Tried to redirect empty command"));
+                };
+                let args = args.drain(..).collect();
+                let target = match parts.next() {
+                    Some(target) => PathBuf::from(target?.as_ref()),
+                    None => return Err(format!("Missing redirect target")),
+                };
+                if let Some(token) = parts.next() {
+                    let token = token?;
+                    return Err(format!("Unexpected token after redirect target: {token}"));
+                }
+                return Ok(CommandLine::Pipe {
+                    source: Command { command, args },
+                    target: PipeTarget::Redirect {
+                        stdout: None,
+                        stderr: Some(RedirectOptions {
+                            append: true,
+                            path: target,
+                        }),
                     },
                 });
             }
@@ -355,23 +434,27 @@ fn handle_command_line(command_line: CommandLine<'_>) -> Result<(), String> {
         CommandLine::Command(command) => handle_command(&command, None, None),
         CommandLine::Pipe { source, target } => {
             let (stdout, stderr) = match target {
-                PipeTarget::Redirect {
-                    stdout,
-                    stderr,
-                    path,
-                } => {
-                    let fd: OwnedFd = File::options()
-                        .create(true)
-                        .write(true)
-                        .open(path)
-                        .map_err(|err| err.to_string())?
-                        .into();
-                    let stdout = if stdout {
-                        Some(PipeWriter::from(fd.try_clone().unwrap()))
+                PipeTarget::Redirect { stdout, stderr } => {
+                    let stdout = if let Some(RedirectOptions { append, path }) = stdout {
+                        let fd: OwnedFd = File::options()
+                            .create(true)
+                            .write(true)
+                            .append(append)
+                            .open(path)
+                            .map_err(|err| err.to_string())?
+                            .into();
+                        Some(PipeWriter::from(fd))
                     } else {
                         None
                     };
-                    let stderr = if stderr {
+                    let stderr = if let Some(RedirectOptions { append, path }) = stderr {
+                        let fd: OwnedFd = File::options()
+                            .create(true)
+                            .write(true)
+                            .append(append)
+                            .open(path)
+                            .map_err(|err| err.to_string())?
+                            .into();
                         Some(PipeWriter::from(fd))
                     } else {
                         None
