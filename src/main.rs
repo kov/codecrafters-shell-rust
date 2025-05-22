@@ -8,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::Child,
     str::CharIndices,
+    sync::Mutex,
 };
 
 struct ReplIter<'r> {
@@ -323,10 +324,37 @@ fn search_path(executable: &str) -> Option<PathBuf> {
     None
 }
 
+lazy_static::lazy_static! {
+    static ref HISTORY: Mutex<Vec<String>> = Mutex::new(vec![]);
+}
+
+fn handle_cmd_history(args: &[Cow<'_, str>]) {
+    let history = HISTORY.lock().expect("poisoned lock");
+    let limit = if args.len() >= 1 {
+        match args[0].parse::<usize>() {
+            Ok(n) => n,
+            Err(err) => {
+                return eprintln!("failed to parse {} as a positive number: {}", args[0], err)
+            }
+        }
+    } else {
+        history.len()
+    };
+
+    let iter = history.iter().enumerate().rev().take(limit);
+    iter.rev().for_each(|(count, command)| {
+        // Test starts counting from 1...
+        let count = count + 1;
+        println!("{count:>5} {command}");
+    });
+}
+
 fn handle_cmd_type(args: &[Cow<'_, str>]) {
     for arg in args {
         match arg.as_ref() {
-            "echo" | "exit" | "type" | "pwd" | "cd" => println!("{arg} is a shell builtin"),
+            "echo" | "exit" | "type" | "pwd" | "cd" | "history" => {
+                println!("{arg} is a shell builtin")
+            }
             _ => match search_path(arg.as_ref()) {
                 Some(path) => println!("{arg} is {}", path.to_string_lossy()),
                 None => println!("{arg}: not found"),
@@ -387,6 +415,7 @@ fn handle_command(
                 println!("{}", args.join(" "));
             }
         }
+        "history" => handle_cmd_history(args),
         "type" => handle_cmd_type(args),
         "cd" => handle_cmd_cd(args),
         "pwd" => {
@@ -483,7 +512,14 @@ fn handle_command_line(
 }
 
 fn handle_input(input: &str) {
-    match parse_command(input.trim()) {
+    let input = input.trim();
+
+    HISTORY
+        .lock()
+        .expect("poisoned lock")
+        .push(input.to_string());
+
+    match parse_command(input) {
         Ok(command_line) => {
             let mut children = vec![];
             if let Err(msg) = handle_command_line(command_line, None, None, None, &mut children) {
