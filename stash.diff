@@ -1,0 +1,23 @@
+diff --git a/your_program.sh b/your_program.sh
+index feb67ec..56da851 100755
+--- a/your_program.sh
++++ b/your_program.sh
+@@ -12,13 +12,13 @@ set -e # Exit early if any commands fail
+ #
+ # - Edit this to change how your program compiles locally
+ # - Edit .codecrafters/compile.sh to change how your program compiles remotely
+-(
+-  cd "$(dirname "$0")" # Ensure compile steps are run within the repository directory
+-  cargo build --release --target-dir=/tmp/codecrafters-build-shell-rust --manifest-path Cargo.toml
+-)
++#(
++#  cd "$(dirname "$0")" # Ensure compile steps are run within the repository directory
++#  cargo build --release --target-dir=/tmp/codecrafters-build-shell-rust --manifest-path Cargo.toml
++#)
+ 
+ # Copied from .codecrafters/run.sh
+ #
+ # - Edit this to change how your program runs locally
+ # - Edit .codecrafters/run.sh to change how your program runs remotely
+-exec /tmp/codecrafters-build-shell-rust/release/codecrafters-shell "$@"
++exec /home/kov/CodeCrafters/codecrafters-shell-rust/target/debug/codecrafters-shell "$@"
