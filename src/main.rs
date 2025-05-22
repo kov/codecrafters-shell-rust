@@ -4,11 +4,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-fn parse_command(command: &str) -> (&str, Vec<&str>) {
+fn parse_command(command: &str) -> Result<(&str, Vec<&str>), String> {
     let mut parts = command.split_ascii_whitespace();
-    let command = parts.next().unwrap();
+    let Some(command) = parts.next() else {
+        return Err(format!("Bad input: {}", command));
+    };
     let args = parts.collect();
-    (command, args)
+    Ok((command, args))
 }
 
 fn search_path(executable: &str) -> Option<PathBuf> {
@@ -76,7 +78,9 @@ fn handle_cmd_cd(args: Vec<&str>) {
 }
 
 fn handle_input(input: &str) {
-    let (command, args) = parse_command(input);
+    let Ok((command, args)) = parse_command(input) else {
+        return;
+    };
     match command {
         "echo" => println!("{}", args.join(" ")),
         "type" => handle_cmd_type(args),
