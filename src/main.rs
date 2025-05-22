@@ -104,8 +104,8 @@ fn handle_input(input: &str) {
             }
         }
         _ => {
-            if let Some(executable) = search_path(command) {
-                match std::process::Command::new(executable).args(args).spawn() {
+            if let Some(_executable) = search_path(command) {
+                match std::process::Command::new(command).args(args).spawn() {
                     Ok(mut child) => {
                         let _ = child.wait();
                     }
