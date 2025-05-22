@@ -1,4 +1,4 @@
-use os_pipe::PipeWriter;
+use os_pipe::{PipeReader, PipeWriter};
 use std::{
     borrow::Cow,
     env::{current_dir, set_current_dir},
@@ -6,6 +6,7 @@ use std::{
     io::{self, Write as _},
     os::fd::OwnedFd,
     path::{Path, PathBuf},
+    process::Child,
     str::CharIndices,
 };
 
@@ -372,8 +373,10 @@ fn handle_cmd_cd(args: &[Cow<'_, str>]) {
 
 fn handle_command(
     command: &Command,
+    stdin: Option<PipeReader>,
     stdout: Option<PipeWriter>,
     stderr: Option<PipeWriter>,
+    children: &mut Vec<Child>,
 ) -> Result<(), String> {
     let (command, args) = (command.command.as_ref(), &command.args);
     match command {
@@ -408,6 +411,9 @@ fn handle_command(
             if let Some(_executable) = search_path(command) {
                 let mut process = std::process::Command::new(command);
                 let mut process = process.args(args.iter().map(|arg| arg.as_ref()));
+                if let Some(stdin) = stdin {
+                    process = process.stdin(stdin);
+                }
                 if let Some(stdout) = stdout {
                     process = process.stdout(stdout);
                 }
@@ -415,9 +421,7 @@ fn handle_command(
                     process = process.stderr(stderr);
                 }
                 match process.spawn() {
-                    Ok(mut child) => {
-                        let _ = child.wait();
-                    }
+                    Ok(child) => children.push(child),
                     Err(e) => println!("Failed to execute {command}: {e}"),
                 }
             } else {
@@ -428,10 +432,16 @@ fn handle_command(
     Ok(())
 }
 
-fn handle_command_line(command_line: CommandLine<'_>) -> Result<(), String> {
+fn handle_command_line(
+    command_line: CommandLine<'_>,
+    stdin: Option<PipeReader>,
+    stdout: Option<PipeWriter>,
+    stderr: Option<PipeWriter>,
+    children: &mut Vec<Child>,
+) -> Result<(), String> {
     match command_line {
         CommandLine::Empty => Ok(()),
-        CommandLine::Command(command) => handle_command(&command, None, None),
+        CommandLine::Command(command) => handle_command(&command, stdin, stdout, stderr, children),
         CommandLine::Pipe { source, target } => {
             let (stdout, stderr) = match target {
                 PipeTarget::Redirect { stdout, stderr } => {
@@ -462,11 +472,12 @@ fn handle_command_line(command_line: CommandLine<'_>) -> Result<(), String> {
                     (stdout, stderr)
                 }
                 PipeTarget::CommandLine(command_line) => {
-                    unimplemented!();
-                    (None, None)
+                    let (reader, writer) = os_pipe::pipe().map_err(|err| err.to_string())?;
+                    handle_command_line(*command_line, Some(reader), stdout, stderr, children)?;
+                    (Some(writer), None)
                 }
             };
-            handle_command(&source, stdout, stderr)
+            handle_command(&source, stdin, stdout, stderr, children)
         }
     }
 }
@@ -474,8 +485,17 @@ fn handle_command_line(command_line: CommandLine<'_>) -> Result<(), String> {
 fn handle_input(input: &str) {
     match parse_command(input.trim()) {
         Ok(command_line) => {
-            if let Err(msg) = handle_command_line(command_line) {
+            let mut children = vec![];
+            if let Err(msg) = handle_command_line(command_line, None, None, None, &mut children) {
                 eprintln!("{}", msg)
+            }
+            while !children.is_empty() {
+                children.retain_mut(|c| match c.try_wait() {
+                    // TODO: we should keep a value for $?
+                    Ok(Some(_)) => false,
+                    Err(_) => false,
+                    Ok(None) => true,
+                });
             }
         }
         Err(msg) => {
