@@ -41,6 +41,11 @@ impl<'r> Iterator for ReplIter<'r> {
 
             match c {
                 '\\' => {
+                    if in_single_quotes || in_double_quotes {
+                        edited.as_mut().map(|s| s.push(c));
+                        continue;
+                    }
+
                     treat_next_char_as_regular = true;
 
                     if edited.is_none() {
