@@ -24,6 +24,26 @@ impl<'r> Iterator for ReplIter<'r> {
         while let Some((i, c)) = self.chars.next() {
             if treat_next_char_as_regular {
                 treat_next_char_as_regular = false;
+
+                // Backslash should keep special meaning when followed by \ $ " \n, but
+                // only when under double quotes
+                if !in_single_quotes && (c == '\\' || c == '$' || c == '"' || c == '\n') {
+                    edited.as_mut().map(|s| s.push(c));
+                    continue;
+                }
+
+                // I assume we should also escape single quotes when under single quotes...
+                if in_single_quotes && c == '\'' {
+                    edited.as_mut().map(|s| s.push(c));
+                    continue;
+                }
+
+                // If we are in quotes we actually want not to treat \ as special other than
+                // in the cases handled above.
+                if in_single_quotes || in_double_quotes {
+                    edited.as_mut().map(|s| s.push('\\'));
+                }
+
                 edited.as_mut().map(|s| s.push(c));
                 continue;
             }
@@ -41,11 +61,6 @@ impl<'r> Iterator for ReplIter<'r> {
 
             match c {
                 '\\' => {
-                    if in_single_quotes || in_double_quotes {
-                        edited.as_mut().map(|s| s.push(c));
-                        continue;
-                    }
-
                     treat_next_char_as_regular = true;
 
                     if edited.is_none() {
