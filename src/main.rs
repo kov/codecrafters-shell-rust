@@ -11,12 +11,14 @@ use rustyline::{
 };
 use std::{
     borrow::Cow,
+    cell::{Cell, RefCell},
     env::{current_dir, set_current_dir},
     fs::{self, File},
-    io::{self, Write as _},
+    io::{self, stdout, Write as _},
     os::{fd::OwnedFd, unix::fs::PermissionsExt as _},
     path::{Path, PathBuf},
     process::Child,
+    rc::Rc,
     str::CharIndices,
     sync::Mutex,
 };
@@ -66,10 +68,16 @@ fn collect_executables_in_path() -> io::Result<Vec<String>> {
     Ok(executables)
 }
 
-type LineEditor = Editor<LineHelper, MemHistory>;
+type LineEditor = Rc<RefCell<Editor<LineHelper, MemHistory>>>;
 
 #[derive(Clone)]
-struct LineHelper;
+struct LineHelper {}
+
+impl LineHelper {
+    fn new() -> Self {
+        LineHelper {}
+    }
+}
 
 impl Completer for LineHelper {
     type Candidate = Pair;
@@ -88,16 +96,20 @@ impl Completer for LineHelper {
         let executables: Vec<&str> = executables.iter().map(|s| s.as_str()).collect();
         matches.extend_from_slice(&executables);
 
-        let matches = matches
-            .iter()
-            .filter(|s| s.starts_with(word))
-            .map(|s| Pair {
-                display: s.to_string(),
-                replacement: format!("{} ", s),
-            })
-            .collect();
+        matches.retain(|s| s.starts_with(word));
+        matches.sort_unstable();
+        matches.dedup();
 
-        Ok((0, matches))
+        Ok((
+            0,
+            matches
+                .iter()
+                .map(|s| Pair {
+                    display: s.to_string(),
+                    replacement: format!("{} ", s),
+                })
+                .collect(),
+        ))
     }
 }
 
@@ -421,8 +433,10 @@ fn search_path(executable: &str) -> Option<PathBuf> {
     None
 }
 
-fn handle_cmd_history(editor: &mut LineEditor, args: &[Cow<'_, str>]) {
-    let history = editor.history();
+fn handle_cmd_history(editor: &LineEditor, args: &[Cow<'_, str>]) {
+    let editor_ref = editor.borrow_mut();
+    let history = editor_ref.history();
+
     let limit = if args.len() >= 1 {
         match args[0].parse::<usize>() {
             Ok(n) => n,
@@ -501,7 +515,7 @@ fn handle_cmd_cd(args: &[Cow<'_, str>]) {
 }
 
 fn handle_command(
-    editor: &mut LineEditor,
+    editor: &LineEditor,
     command: &Command,
     stdin: Option<PipeReader>,
     stdout: Option<PipeWriter>,
@@ -564,7 +578,7 @@ fn handle_command(
 }
 
 fn handle_command_line(
-    editor: &mut LineEditor,
+    editor: &LineEditor,
     command_line: CommandLine<'_>,
     stdin: Option<PipeReader>,
     stdout: Option<PipeWriter>,
@@ -574,7 +588,7 @@ fn handle_command_line(
     match command_line {
         CommandLine::Empty => Ok(()),
         CommandLine::Command(command) => {
-            handle_command(editor, &command, stdin, stdout, stderr, children)
+            handle_command(&editor, &command, stdin, stdout, stderr, children)
         }
         CommandLine::Pipe { source, target } => {
             let (stdout, stderr) = match target {
@@ -608,7 +622,7 @@ fn handle_command_line(
                 PipeTarget::CommandLine(command_line) => {
                     let (reader, writer) = os_pipe::pipe().map_err(|err| err.to_string())?;
                     handle_command_line(
-                        editor,
+                        &editor,
                         *command_line,
                         Some(reader),
                         stdout,
@@ -618,22 +632,25 @@ fn handle_command_line(
                     (Some(writer), None)
                 }
             };
-            handle_command(editor, &source, stdin, stdout, stderr, children)
+            handle_command(&editor, &source, stdin, stdout, stderr, children)
         }
     }
 }
 
-fn handle_input(editor: &mut LineEditor, input: &str) {
+fn handle_input(editor: LineEditor, input: &str) {
     let input = input.trim();
 
-    let history = editor.history_mut();
-    history.add(input).expect("Failed to add to history");
+    {
+        let mut editor_ref = editor.borrow_mut();
+        let history = editor_ref.history_mut();
+        history.add(input).expect("Failed to add to history");
+    }
 
     match parse_command(input) {
         Ok(command_line) => {
             let mut children = vec![];
             if let Err(msg) =
-                handle_command_line(editor, command_line, None, None, None, &mut children)
+                handle_command_line(&editor, command_line, None, None, None, &mut children)
             {
                 eprintln!("{}", msg)
             }
@@ -653,16 +670,27 @@ fn handle_input(editor: &mut LineEditor, input: &str) {
 }
 
 fn main() {
-    let mut editor = rustyline::Editor::with_history(Config::default(), MemHistory::new())
-        .expect("Failed to create default editor for rustyline");
-    editor.set_helper(Some(LineHelper {}));
+    let config = Config::builder()
+        .completion_type(rustyline::CompletionType::List)
+        .build();
+    let editor = Rc::new(RefCell::new(
+        rustyline::Editor::with_history(config, MemHistory::new())
+            .expect("Failed to create default editor for rustyline"),
+    ));
+    let helper = LineHelper::new();
+    editor.borrow_mut().set_helper(Some(helper));
 
     loop {
-        match editor.readline("$ ") {
-            Ok(input) => handle_input(&mut editor, input.as_str()),
+        let input = match editor.borrow_mut().readline("$ ") {
+            Ok(input) => Some(input),
             Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => break,
-            Err(ReadlineError::WindowResized) => (),
+            Err(ReadlineError::WindowResized) => None,
             Err(err) => panic!("Error: {err}"),
         };
+
+        // This is to detach handling the input from the borrow_mut above.
+        if let Some(input) = input {
+            handle_input(editor.clone(), input.as_str())
+        }
     }
 }
