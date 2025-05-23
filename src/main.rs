@@ -12,9 +12,9 @@ use rustyline::{
 use std::{
     borrow::Cow,
     env::{current_dir, set_current_dir},
-    fs::File,
-    io::Write as _,
-    os::fd::OwnedFd,
+    fs::{self, File},
+    io::{self, Write as _},
+    os::{fd::OwnedFd, unix::fs::PermissionsExt as _},
     path::{Path, PathBuf},
     process::Child,
     str::CharIndices,
@@ -24,6 +24,46 @@ use std::{
 lazy_static! {
     static ref BUILTINS: Mutex<Box<[&'static str]>> =
         Mutex::new(Box::new(["echo", "exit", "type", "pwd", "cd", "history"]));
+}
+
+fn is_executable(entry: &fs::DirEntry) -> bool {
+    let path = entry.path();
+
+    if let Ok(metadata) = fs::metadata(&path) {
+        if metadata.is_file() {
+            let mode = metadata.permissions().mode();
+            return mode & 0o111 != 0;
+        }
+    }
+
+    false
+}
+
+fn collect_executables_in_path() -> io::Result<Vec<String>> {
+    let path_env = std::env::var("PATH").expect("Failed to read PATH environment variable");
+    let path_candidates: Vec<&str> = path_env.split(':').collect();
+
+    let mut executables = vec![];
+    for candidate in path_candidates {
+        let dir = fs::read_dir(candidate);
+
+        // We may have directories that do not exist anymore on PATH.
+        if dir.is_err() {
+            continue;
+        }
+
+        // We protect against this unwrap panicking by checking and continuing above.
+        for entry in dir.unwrap() {
+            let entry = entry?;
+            if is_executable(&entry) {
+                if let Some(filename) = entry.path().file_name() {
+                    executables.push(filename.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+
+    Ok(executables)
 }
 
 type LineEditor = Editor<LineHelper, MemHistory>;
@@ -41,7 +81,14 @@ impl Completer for LineHelper {
         _ctx: &Context<'_>,
     ) -> Result<(usize, Vec<Pair>), rustyline::error::ReadlineError> {
         let word = &line[..pos];
-        let matches = (*BUILTINS.lock().expect("poisoned lock"))
+
+        let mut matches = (*BUILTINS.lock().expect("poisoned lock")).to_vec();
+
+        let executables = collect_executables_in_path()?;
+        let executables: Vec<&str> = executables.iter().map(|s| s.as_str()).collect();
+        matches.extend_from_slice(&executables);
+
+        let matches = matches
             .iter()
             .filter(|s| s.starts_with(word))
             .map(|s| Pair {
@@ -49,6 +96,7 @@ impl Completer for LineHelper {
                 replacement: format!("{} ", s),
             })
             .collect();
+
         Ok((0, matches))
     }
 }
