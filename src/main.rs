@@ -1,8 +1,13 @@
+use lazy_static::lazy_static;
 use os_pipe::{PipeReader, PipeWriter};
 use rustyline::{
+    completion::{Completer, Pair},
     error::ReadlineError,
+    highlight::Highlighter,
+    hint::Hinter,
     history::{History as _, MemHistory, SearchDirection},
-    Config, Editor,
+    validate::Validator,
+    Config, Context, Editor, Helper,
 };
 use std::{
     borrow::Cow,
@@ -13,9 +18,47 @@ use std::{
     path::{Path, PathBuf},
     process::Child,
     str::CharIndices,
+    sync::Mutex,
 };
 
-type LineEditor = Editor<(), MemHistory>;
+lazy_static! {
+    static ref BUILTINS: Mutex<Box<[&'static str]>> =
+        Mutex::new(Box::new(["echo", "exit", "type", "pwd", "cd", "history"]));
+}
+
+type LineEditor = Editor<LineHelper, MemHistory>;
+
+#[derive(Clone)]
+struct LineHelper;
+
+impl Completer for LineHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> Result<(usize, Vec<Pair>), rustyline::error::ReadlineError> {
+        let word = &line[..pos];
+        let matches = (*BUILTINS.lock().expect("poisoned lock"))
+            .iter()
+            .filter(|s| s.starts_with(word))
+            .map(|s| Pair {
+                display: s.to_string(),
+                replacement: format!("{} ", s),
+            })
+            .collect();
+        Ok((0, matches))
+    }
+}
+
+impl Helper for LineHelper {}
+impl Hinter for LineHelper {
+    type Hint = String;
+}
+impl Highlighter for LineHelper {}
+impl Validator for LineHelper {}
 
 struct ReplIter<'r> {
     command: &'r str,
@@ -564,6 +607,7 @@ fn handle_input(editor: &mut LineEditor, input: &str) {
 fn main() {
     let mut editor = rustyline::Editor::with_history(Config::default(), MemHistory::new())
         .expect("Failed to create default editor for rustyline");
+    editor.set_helper(Some(LineHelper {}));
 
     loop {
         match editor.readline("$ ") {
