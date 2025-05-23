@@ -1,15 +1,21 @@
 use os_pipe::{PipeReader, PipeWriter};
+use rustyline::{
+    error::ReadlineError,
+    history::{History as _, MemHistory, SearchDirection},
+    Config, Editor,
+};
 use std::{
     borrow::Cow,
     env::{current_dir, set_current_dir},
     fs::File,
-    io::{self, Write as _},
+    io::Write as _,
     os::fd::OwnedFd,
     path::{Path, PathBuf},
     process::Child,
     str::CharIndices,
-    sync::Mutex,
 };
+
+type LineEditor = Editor<(), MemHistory>;
 
 struct ReplIter<'r> {
     command: &'r str,
@@ -324,12 +330,8 @@ fn search_path(executable: &str) -> Option<PathBuf> {
     None
 }
 
-lazy_static::lazy_static! {
-    static ref HISTORY: Mutex<Vec<String>> = Mutex::new(vec![]);
-}
-
-fn handle_cmd_history(args: &[Cow<'_, str>]) {
-    let history = HISTORY.lock().expect("poisoned lock");
+fn handle_cmd_history(editor: &mut LineEditor, args: &[Cow<'_, str>]) {
+    let history = editor.history();
     let limit = if args.len() >= 1 {
         match args[0].parse::<usize>() {
             Ok(n) => n,
@@ -341,7 +343,15 @@ fn handle_cmd_history(args: &[Cow<'_, str>]) {
         history.len()
     };
 
-    let iter = history.iter().enumerate().rev().take(limit);
+    let mut items = vec![];
+    for i in 0.. {
+        let Ok(Some(result)) = history.get(i, SearchDirection::Forward) else {
+            break;
+        };
+        items.push(result.entry.to_string());
+    }
+
+    let iter = items.iter().enumerate().rev().take(limit);
     iter.rev().for_each(|(count, command)| {
         // Test starts counting from 1...
         let count = count + 1;
@@ -400,6 +410,7 @@ fn handle_cmd_cd(args: &[Cow<'_, str>]) {
 }
 
 fn handle_command(
+    editor: &mut LineEditor,
     command: &Command,
     stdin: Option<PipeReader>,
     stdout: Option<PipeWriter>,
@@ -415,7 +426,7 @@ fn handle_command(
                 println!("{}", args.join(" "));
             }
         }
-        "history" => handle_cmd_history(args),
+        "history" => handle_cmd_history(editor, args),
         "type" => handle_cmd_type(args),
         "cd" => handle_cmd_cd(args),
         "pwd" => {
@@ -462,6 +473,7 @@ fn handle_command(
 }
 
 fn handle_command_line(
+    editor: &mut LineEditor,
     command_line: CommandLine<'_>,
     stdin: Option<PipeReader>,
     stdout: Option<PipeWriter>,
@@ -470,7 +482,9 @@ fn handle_command_line(
 ) -> Result<(), String> {
     match command_line {
         CommandLine::Empty => Ok(()),
-        CommandLine::Command(command) => handle_command(&command, stdin, stdout, stderr, children),
+        CommandLine::Command(command) => {
+            handle_command(editor, &command, stdin, stdout, stderr, children)
+        }
         CommandLine::Pipe { source, target } => {
             let (stdout, stderr) = match target {
                 PipeTarget::Redirect { stdout, stderr } => {
@@ -502,27 +516,34 @@ fn handle_command_line(
                 }
                 PipeTarget::CommandLine(command_line) => {
                     let (reader, writer) = os_pipe::pipe().map_err(|err| err.to_string())?;
-                    handle_command_line(*command_line, Some(reader), stdout, stderr, children)?;
+                    handle_command_line(
+                        editor,
+                        *command_line,
+                        Some(reader),
+                        stdout,
+                        stderr,
+                        children,
+                    )?;
                     (Some(writer), None)
                 }
             };
-            handle_command(&source, stdin, stdout, stderr, children)
+            handle_command(editor, &source, stdin, stdout, stderr, children)
         }
     }
 }
 
-fn handle_input(input: &str) {
+fn handle_input(editor: &mut LineEditor, input: &str) {
     let input = input.trim();
 
-    HISTORY
-        .lock()
-        .expect("poisoned lock")
-        .push(input.to_string());
+    let history = editor.history_mut();
+    history.add(input).expect("Failed to add to history");
 
     match parse_command(input) {
         Ok(command_line) => {
             let mut children = vec![];
-            if let Err(msg) = handle_command_line(command_line, None, None, None, &mut children) {
+            if let Err(msg) =
+                handle_command_line(editor, command_line, None, None, None, &mut children)
+            {
                 eprintln!("{}", msg)
             }
             while !children.is_empty() {
@@ -541,16 +562,15 @@ fn handle_input(input: &str) {
 }
 
 fn main() {
+    let mut editor = rustyline::Editor::with_history(Config::default(), MemHistory::new())
+        .expect("Failed to create default editor for rustyline");
+
     loop {
-        // Uncomment this block to pass the first stage
-        print!("$ ");
-        io::stdout().flush().unwrap();
-
-        // Wait for user input
-        let stdin = io::stdin();
-        let mut input = String::new();
-        stdin.read_line(&mut input).unwrap();
-
-        handle_input(input.as_str());
+        match editor.readline("$ ") {
+            Ok(input) => handle_input(&mut editor, input.as_str()),
+            Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => break,
+            Err(ReadlineError::WindowResized) => (),
+            Err(err) => panic!("Error: {err}"),
+        };
     }
 }
