@@ -274,6 +274,62 @@ enum CommandLine<'r> {
     },
 }
 
+#[derive(Copy, Clone)]
+enum RedirectStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Copy, Clone)]
+enum RedirectMode {
+    Truncate,
+    Append,
+}
+
+fn parse_redirect<'r>(
+    command: Option<Cow<'r, str>>,
+    args: &mut Vec<Cow<'r, str>>,
+    parts: &mut ReplIter<'r>,
+    stream: RedirectStream,
+    mode: RedirectMode,
+) -> Result<CommandLine<'r>, String> {
+    let Some(command) = command else {
+        return Err(format!("Tried to redirect empty command"));
+    };
+    let args = args.drain(..).collect();
+    let target = match parts.next() {
+        Some(target) => PathBuf::from(target?.as_ref()),
+        None => return Err(format!("Missing redirect target")),
+    };
+    if let Some(token) = parts.next() {
+        let token = token?;
+        return Err(format!("Unexpected token after redirect target: {token}"));
+    }
+    let append = matches!(mode, RedirectMode::Append);
+    match stream {
+        RedirectStream::Stdout => Ok(CommandLine::Pipe {
+            source: Command { command, args },
+            target: PipeTarget::Redirect {
+                stdout: Some(RedirectOptions {
+                    append,
+                    path: target,
+                }),
+                stderr: None,
+            },
+        }),
+        RedirectStream::Stderr => Ok(CommandLine::Pipe {
+            source: Command { command, args },
+            target: PipeTarget::Redirect {
+                stdout: None,
+                stderr: Some(RedirectOptions {
+                    append,
+                    path: target,
+                }),
+            },
+        }),
+    }
+}
+
 fn parse_parts<'r>(mut parts: ReplIter<'r>) -> Result<CommandLine<'r>, String> {
     let mut command = None;
     let mut args = vec![];
@@ -282,100 +338,16 @@ fn parse_parts<'r>(mut parts: ReplIter<'r>) -> Result<CommandLine<'r>, String> {
 
         match part.as_ref() {
             "1>" | ">" => {
-                let Some(command) = command else {
-                    return Err(format!("Tried to redirect empty command"));
-                };
-                let args = args.drain(..).collect();
-                let target = match parts.next() {
-                    Some(target) => PathBuf::from(target?.as_ref()),
-                    None => return Err(format!("Missing redirect target")),
-                };
-                if let Some(token) = parts.next() {
-                    let token = token?;
-                    return Err(format!("Unexpected token after redirect target: {token}"));
-                }
-                return Ok(CommandLine::Pipe {
-                    source: Command { command, args },
-                    target: PipeTarget::Redirect {
-                        stdout: Some(RedirectOptions {
-                            append: false,
-                            path: target,
-                        }),
-                        stderr: None,
-                    },
-                });
+                return parse_redirect(command, &mut args, &mut parts, RedirectStream::Stdout, RedirectMode::Truncate);
             }
             "2>" => {
-                let Some(command) = command else {
-                    return Err(format!("Tried to redirect empty command"));
-                };
-                let args = args.drain(..).collect();
-                let target = match parts.next() {
-                    Some(target) => PathBuf::from(target?.as_ref()),
-                    None => return Err(format!("Missing redirect target")),
-                };
-                if let Some(token) = parts.next() {
-                    let token = token?;
-                    return Err(format!("Unexpected token after redirect target: {token}"));
-                }
-                return Ok(CommandLine::Pipe {
-                    source: Command { command, args },
-                    target: PipeTarget::Redirect {
-                        stdout: None,
-                        stderr: Some(RedirectOptions {
-                            append: false,
-                            path: target,
-                        }),
-                    },
-                });
+                return parse_redirect(command, &mut args, &mut parts, RedirectStream::Stderr, RedirectMode::Truncate);
             }
             "1>>" | ">>" => {
-                let Some(command) = command else {
-                    return Err(format!("Tried to redirect empty command"));
-                };
-                let args = args.drain(..).collect();
-                let target = match parts.next() {
-                    Some(target) => PathBuf::from(target?.as_ref()),
-                    None => return Err(format!("Missing redirect target")),
-                };
-                if let Some(token) = parts.next() {
-                    let token = token?;
-                    return Err(format!("Unexpected token after redirect target: {token}"));
-                }
-                return Ok(CommandLine::Pipe {
-                    source: Command { command, args },
-                    target: PipeTarget::Redirect {
-                        stdout: Some(RedirectOptions {
-                            append: true,
-                            path: target,
-                        }),
-                        stderr: None,
-                    },
-                });
+                return parse_redirect(command, &mut args, &mut parts, RedirectStream::Stdout, RedirectMode::Append);
             }
             "2>>" => {
-                let Some(command) = command else {
-                    return Err(format!("Tried to redirect empty command"));
-                };
-                let args = args.drain(..).collect();
-                let target = match parts.next() {
-                    Some(target) => PathBuf::from(target?.as_ref()),
-                    None => return Err(format!("Missing redirect target")),
-                };
-                if let Some(token) = parts.next() {
-                    let token = token?;
-                    return Err(format!("Unexpected token after redirect target: {token}"));
-                }
-                return Ok(CommandLine::Pipe {
-                    source: Command { command, args },
-                    target: PipeTarget::Redirect {
-                        stdout: None,
-                        stderr: Some(RedirectOptions {
-                            append: true,
-                            path: target,
-                        }),
-                    },
-                });
+                return parse_redirect(command, &mut args, &mut parts, RedirectStream::Stderr, RedirectMode::Append);
             }
             "|" => {
                 let Some(command) = command else {
